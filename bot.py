@@ -1,57 +1,91 @@
 import os
 import logging
 import requests
+import pandas as pd
+from dotenv import load_dotenv
 from ratelimit import limits, sleep_and_retry
 
-# Setup Logging
+# 1. Initialization
+load_dotenv() 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('TradingBot')
 
-# Configuration from Environment Variables (injected by GitHub Secrets)
+# 2. Configuration
 BASE_URL = "https://api-capital.backend-capital.com"
-HEADERS = {
-    "X-CAP-API-KEY": os.getenv("CAPITAL_API_KEY"),
-    "Content-Type": "application/json",
-    "CST": None,
-    "X-SECURITY-TOKEN": None
-}
+STARTING_BALANCE = 1000.0
+LOSS_LIMIT = 0.02
 
-def authenticate():
-    """Authenticates and sets session tokens in HEADERS."""
+def get_auth_headers():
+    """Authenticates and returns session headers."""
     url = f"{BASE_URL}/api/v1/session"
     payload = {
-        "identifier": os.getenv("CAPITAL_EMAIL"),
+        "identifier": os.getenv("CAPITAL_EMAIL"), 
         "password": os.getenv("CAPITAL_API_PASSWORD")
     }
-    response = requests.post(url, headers=HEADERS, json=payload)
-    if response.status_code == 200:
-        HEADERS["CST"] = response.headers["CST"]
-        HEADERS["X-SECURITY-TOKEN"] = response.headers["X-SECURITY-TOKEN"]
-        logger.info("Authentication successful.")
-    else:
-        logger.error(f"Auth failed: {response.status_code} {response.text}")
-        exit(1)
+    headers = {"X-CAP-API-KEY": os.getenv("CAPITAL_API_KEY"), "Content-Type": "application/json"}
+    resp = requests.post(url, json=payload, headers=headers)
+    
+    if resp.status_code != 200:
+        logger.error(f"Auth failed: {resp.text}")
+        raise Exception("Authentication failed")
+        
+    return {
+        "X-CAP-API-KEY": os.getenv("CAPITAL_API_KEY"), 
+        "CST": resp.headers["CST"], 
+        "X-SECURITY-TOKEN": resp.headers["X-SECURITY-TOKEN"],
+        "Content-Type": "application/json"
+    }
 
 @sleep_and_retry
 @limits(calls=5, period=1)
-def get_account_data():
-    """Fetch real-time equity directly from API."""
-    url = f"{BASE_URL}/api/v1/accounts"
-    return requests.get(url, headers=HEADERS).json()
+def get_rsi(epic, headers, period=14):
+    """Calculates RSI to determine market momentum."""
+    resp = requests.get(f"{BASE_URL}/api/v1/marketdata/{epic}", headers=headers).json()
+    prices = pd.Series([item['closePrice']['bid'] for item in resp['prices']])
+    
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs.iloc[-1]))
 
 def run_trading_strategy():
-    authenticate()
-    
-    # 1. Circuit Breaker: Always verify safety first
-    account = get_account_data()
-    # Logic to compare balance vs starting_balance
-    logger.info("Bot execution cycle started.")
-    
-    # 2. Strategy: Check positions and market prices here
-    # Since this is stateless, you do not need active_deals.json.
-    # Just fetch /positions to see what is currently open.
-    
-    logger.info("Cycle complete. Shutting down until next trigger.")
+    logger.info("--- Starting Strategy Cycle ---")
+    try:
+        headers = get_auth_headers()
+        
+        # 1. Account Check (Circuit Breaker)
+        acc_resp = requests.get(f"{BASE_URL}/api/v1/accounts", headers=headers)
+        acc_data = acc_resp.json()
+        
+        # Safely extract account balance
+        account_info = acc_data[0] if isinstance(acc_data, list) else acc_data['accounts'][0]
+        balance_info = account_info.get('balance', {})
+        current_equity = balance_info.get('balance', 0.0) 
+        
+        if (STARTING_BALANCE - current_equity) / STARTING_BALANCE >= LOSS_LIMIT:
+            logger.critical(f"LOSS LIMIT REACHED: Equity is {current_equity}. Safety stop activated.")
+            return 
+
+        # 2. Strategy Execution
+        epic = "EURUSD"
+        rsi = get_rsi(epic, headers)
+        
+        if pd.isna(rsi):
+            logger.warning("RSI calculation inconclusive. Waiting for more data.")
+            return
+
+        logger.info(f"Current {epic} RSI: {rsi:.2f}")
+
+        if rsi < 30:
+            logger.info("Signal: RSI < 30 (Oversold). Preparing Buy Order.")
+        elif rsi > 70:
+            logger.info("Signal: RSI > 70 (Overbought). Preparing Sell Order.")
+        else:
+            logger.info("Signal: Neutral market. No trade executed.")
+            
+    except Exception as e:
+        logger.error(f"Strategy execution error: {e}")
 
 if __name__ == "__main__":
     run_trading_strategy()
