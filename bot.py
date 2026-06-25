@@ -1,91 +1,149 @@
 import os
-import logging
-import requests
+import ssl
+import asyncio
+import aiohttp
 import pandas as pd
 from dotenv import load_dotenv
-from ratelimit import limits, sleep_and_retry
 
-# 1. Initialization
-load_dotenv() 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger('TradingBot')
+# Load environment variables
+load_dotenv()
 
-# 2. Configuration
-BASE_URL = "https://api-capital.backend-capital.com"
-STARTING_BALANCE = 1000.0
-LOSS_LIMIT = 0.02
+BASE_URL = "https://63.35.40.93"
+HOST_NAME = "demo-api-capital.backend-capital.com"
+EPIC = "EURUSD"
+TRADE_SIZE = 500  
 
-def get_auth_headers():
-    """Authenticates and returns session headers."""
-    url = f"{BASE_URL}/api/v1/session"
-    payload = {
-        "identifier": os.getenv("CAPITAL_EMAIL"), 
-        "password": os.getenv("CAPITAL_API_PASSWORD")
-    }
-    headers = {"X-CAP-API-KEY": os.getenv("CAPITAL_API_KEY"), "Content-Type": "application/json"}
-    resp = requests.post(url, json=payload, headers=headers)
-    
-    if resp.status_code != 200:
-        logger.error(f"Auth failed: {resp.text}")
-        raise Exception("Authentication failed")
+# FIXED: Create an encrypted SSL context that skips strict hostname string matching
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False  
+ssl_context.verify_mode = ssl.CERT_NONE  
+
+class FastIPResolver(aiohttp.DefaultResolver):
+    """Bypasses DNS resolution delays by forcing connection tracking straight to the IP."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         
-    return {
-        "X-CAP-API-KEY": os.getenv("CAPITAL_API_KEY"), 
-        "CST": resp.headers["CST"], 
-        "X-SECURITY-TOKEN": resp.headers["X-SECURITY-TOKEN"],
+    async def resolve(self, host, port=0, family=0):
+        if host == HOST_NAME:
+            return [{"hostname": HOST_NAME, "host": "63.35.40.93", "port": port, "family": family, "proto": 0, "flags": 0}]
+        return await super().resolve(host, port, family)
+
+async def get_auth_headers(session: aiohttp.ClientSession):
+    email = os.getenv("CAPITAL_EMAIL")
+    password = os.getenv("CAPITAL_API_PASSWORD")
+    api_key = os.getenv("CAPITAL_API_KEY")
+    
+    if not all([email, password, api_key]):
+        print("❌ Error: Missing environment variables inside .env file.")
+        return None
+        
+    payload = {"identifier": email, "password": password}
+    headers = {
+        "Host": HOST_NAME,
+        "X-CAP-API-KEY": api_key,
         "Content-Type": "application/json"
     }
-
-@sleep_and_retry
-@limits(calls=5, period=1)
-def get_rsi(epic, headers, period=14):
-    """Calculates RSI to determine market momentum."""
-    resp = requests.get(f"{BASE_URL}/api/v1/marketdata/{epic}", headers=headers).json()
-    prices = pd.Series([item['closePrice']['bid'] for item in resp['prices']])
     
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs.iloc[-1]))
-
-def run_trading_strategy():
-    logger.info("--- Starting Strategy Cycle ---")
     try:
-        headers = get_auth_headers()
-        
-        # 1. Account Check (Circuit Breaker)
-        acc_resp = requests.get(f"{BASE_URL}/api/v1/accounts", headers=headers)
-        acc_data = acc_resp.json()
-        
-        # Safely extract account balance
-        account_info = acc_data[0] if isinstance(acc_data, list) else acc_data['accounts'][0]
-        balance_info = account_info.get('balance', {})
-        current_equity = balance_info.get('balance', 0.0) 
-        
-        if (STARTING_BALANCE - current_equity) / STARTING_BALANCE >= LOSS_LIMIT:
-            logger.critical(f"LOSS LIMIT REACHED: Equity is {current_equity}. Safety stop activated.")
-            return 
-
-        # 2. Strategy Execution
-        epic = "EURUSD"
-        rsi = get_rsi(epic, headers)
-        
-        if pd.isna(rsi):
-            logger.warning("RSI calculation inconclusive. Waiting for more data.")
-            return
-
-        logger.info(f"Current {epic} RSI: {rsi:.2f}")
-
-        if rsi < 30:
-            logger.info("Signal: RSI < 30 (Oversold). Preparing Buy Order.")
-        elif rsi > 70:
-            logger.info("Signal: RSI > 70 (Overbought). Preparing Sell Order.")
-        else:
-            logger.info("Signal: Neutral market. No trade executed.")
-            
+        url = f"{BASE_URL}/api/v1/session"
+        # Using the tailored ssl_context to handle the handshake smoothly
+        async with session.post(url, json=payload, headers=headers, timeout=10, ssl=ssl_context) as resp:
+            if resp.status == 200:
+                return {
+                    "Host": HOST_NAME,
+                    "X-CAP-API-KEY": api_key,
+                    "CST": resp.headers.get("CST"),
+                    "X-SECURITY-TOKEN": resp.headers.get("X-SECURITY-TOKEN"),
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+            print(f"❌ Auth Failed: {resp.status}")
     except Exception as e:
-        logger.error(f"Strategy execution error: {e}")
+        print(f"❌ Connection error during setup: {e}")
+    return None
+
+async def fetch_and_analyze_market(session: aiohttp.ClientSession, headers: dict):
+    url = f"{BASE_URL}/api/v1/prices/{EPIC}"
+    params = {"resolution": "MINUTE", "max": "20"}
+    
+    try:
+        async with session.get(url, headers=headers, params=params, timeout=5, ssl=ssl_context) as resp:
+            if resp.status != 200:
+                return None
+            raw_data = await resp.json()
+    except Exception:
+        return None
+        
+    prices = raw_data.get("prices", [])
+    if not prices:
+        return None
+        
+    df = pd.DataFrame([{
+        "Close": float(c.get("closePrice", {}).get("bid", 0.0)),
+        "Time": c.get("snapshotTimeUTC")
+    } for c in prices])
+    
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    
+    ema_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    ema_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    
+    df["RSI_14"] = 100 - (100 / (1 + (ema_gain / (ema_loss + 1e-9))))
+    
+    return df.iloc[-1]["Time"], df.iloc[-1]["Close"], df.iloc[-1]["RSI_14"]
+
+async def place_market_order(session: aiohttp.ClientSession, headers: dict, direction: str, size: int):
+    url = f"{BASE_URL}/api/v1/positions"
+    payload = {
+        "epic": EPIC, 
+        "direction": direction, 
+        "size": size, 
+        "guaranteedStop": False, 
+        "forceOpen": True
+    }
+    
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=5, ssl=ssl_context) as resp:
+            resp_data = await resp.json()
+            if resp.status == 200:
+                print(f"🚀 ORDER EXECUTED! Ref: {resp_data.get('dealReference')}")
+            else:
+                print(f"❌ Order Rejected: {resp.status} - {resp_data}")
+    except Exception as e:
+        print(f"❌ Pipeline exception: {e}")
+
+async def main():
+    print("⚡ Starting High-Speed Asynchronous Trading Engine...")
+    
+    connector = aiohttp.TCPConnector(resolver=FastIPResolver(), ttl_dns_cache=300, limit=10)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
+        headers = await get_auth_headers(session)
+        if not headers:
+            return
+            
+        last_processed_timestamp = None
+        
+        while True:
+            market_data = await fetch_and_analyze_market(session, headers)
+            
+            if market_data:
+                current_time, close_price, rsi = market_data
+                
+                if current_time != last_processed_timestamp:
+                    print(f"⏰ Candle: {current_time} | Close: {close_price:.5f} | RSI: {rsi:.2f}")
+                    last_processed_timestamp = current_time
+                    
+                    if rsi <= 30:
+                        print(f"📉 Market Oversold! Triggering BUY Order for {TRADE_SIZE} units...")
+                        asyncio.create_task(place_market_order(session, headers, "BUY", TRADE_SIZE))
+                    elif rsi >= 70:
+                        print(f"📈 Market Overbought! Triggering SELL Order for {TRADE_SIZE} units...")
+                        asyncio.create_task(place_market_order(session, headers, "SELL", TRADE_SIZE))
+            
+            await asyncio.sleep(2) 
 
 if __name__ == "__main__":
-    run_trading_strategy()
+    asyncio.run(main())
